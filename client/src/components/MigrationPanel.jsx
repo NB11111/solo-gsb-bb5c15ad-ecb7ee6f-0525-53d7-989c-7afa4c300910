@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { migrateSamples as callMigrate } from "../api.js";
 import { SideResult } from "./CounterexamplePanel.jsx";
+import { acceptResponse, isRunFresh, migrationSignature } from "../migrationBinding.js";
 
 // Keep in sync with MAX_SAMPLES in server/migrate.js.
 const MAX_SAMPLES = 200;
@@ -146,38 +147,90 @@ function SampleItem({ item }) {
  * success/conflict/invalid, expands a before/after comparison per sample and
  * copies ONLY the successful results.
  *
- * Schemas changing (re-inferred or baseline replaced) drops the previous run,
- * mirroring the sample impact scan.
+ * Every run is bound to the exact inputs it was submitted with: the sample
+ * text, the full mapping set (paths AND default values) and both schema
+ * versions. Editing any of those inputs immediately hides the stale summary,
+ * details and copy entry and asks for a re-migration. A response returning
+ * from an in-flight request is accepted only while the request is still the
+ * latest one AND every input still matches what it was sent with; an expired
+ * response neither backfills its errors nor overwrites a newer run.
  */
 export default function MigrationPanel({ baselineSchema, currentSchema }) {
   const [text, setText] = useState("");
   const [parseError, setParseError] = useState(null);
   const [error, setError] = useState(null);
   const [mappingError, setMappingError] = useState(null);
-  const [busy, setBusy] = useState(false);
   const [mappings, setMappings] = useState([
     { from: "/phone", to: "/contact/phone", defaultText: "" },
   ]);
   const [result, setResult] = useState(null);
   const [invalidMappings, setInvalidMappings] = useState([]);
   const [copied, setCopied] = useState(false);
+  // True while the latest run's request is still in flight.
+  const [busy, setBusy] = useState(false);
+  // Input fingerprint the latest run is bound to — set when the user starts
+  // the run (covering both its client-side validation errors and the eventual
+  // server response), cleared to null on the first edit afterwards. The
+  // summary/details/copy entry stay live only while this equals the current
+  // input fingerprint.
+  const [runSignature, setRunSignature] = useState(null);
 
+  // Fingerprint of every input that can change a migration outcome: the sample
+  // text, the full mapping set (paths AND default values) and both schemas.
+  const inputSignature = useMemo(
+    () => migrationSignature({ text, mappings, baselineSchema, currentSchema }),
+    [text, mappings, baselineSchema, currentSchema]
+  );
+
+  // Monotonic token: only the request started by the latest run may settle.
+  const runSeqRef = useRef(0);
+  // Previous render's input signature, updated synchronously in render: an
+  // input edit invalidates an in-flight request immediately (bumps the token),
+  // before the promise continuation or the reset effect can run.
+  const signatureRef = useRef(inputSignature);
+  if (signatureRef.current !== inputSignature) {
+    signatureRef.current = inputSignature;
+    runSeqRef.current += 1;
+  }
+
+  // After an input edit, drop the previous run's summary/details/copy entry
+  // and stop the spinner. (Display is also gated on the binding below, so the
+  // stale run is hidden on the very frame the edit is painted.) The first
+  // effect run is the mount, where there is nothing to clear.
+  const firstSyncRef = useRef(true);
   useEffect(() => {
+    if (firstSyncRef.current) {
+      firstSyncRef.current = false;
+      return;
+    }
     setResult(null);
     setError(null);
+    setMappingError(null);
     setInvalidMappings([]);
-  }, [baselineSchema, currentSchema]);
+    setCopied(false);
+    setBusy(false);
+  }, [inputSignature]);
+
+  // A run is current only while its submitted inputs are still the inputs on
+  // screen. Editing the samples, mappings, defaults or either schema breaks
+  // the binding until the user migrates again.
+  const isFresh = isRunFresh(runSignature, inputSignature);
+  const showResult = result !== null && isFresh;
+  const showStale = runSignature !== null && !isFresh;
 
   const groups = useMemo(() => {
-    if (!result) return [];
+    if (!showResult) return [];
     const byStatus = new Map(STATUS_ORDER.map((s) => [s, []]));
     for (const item of result.samples) byStatus.get(item.status).push(item);
     return STATUS_ORDER.map((s) => [s, byStatus.get(s)]);
-  }, [result]);
+  }, [showResult, result]);
 
   const successfulSamples = useMemo(
-    () => (result ? result.samples.filter((s) => s.status === "success").map((s) => s.after) : []),
-    [result]
+    () =>
+      showResult
+        ? result.samples.filter((s) => s.status === "success").map((s) => s.after)
+        : [],
+    [showResult, result]
   );
 
   function updateMapping(index, next) {
@@ -204,6 +257,13 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
   }
 
   async function run() {
+    // This run supersedes any request still in flight. The attempt (including
+    // its client-side validation errors) is bound to the inputs right now;
+    // editing them afterwards hides this run until the user migrates again.
+    const seq = ++runSeqRef.current;
+    const submittedSignature = inputSignature;
+    setRunSignature(submittedSignature);
+    setBusy(false);
     setError(null);
     setMappingError(null);
     setInvalidMappings([]);
@@ -247,17 +307,23 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
     if (requestMappings.some((m) => m.to === "")) {
       setMappingError('目标 JSON Pointer 不能为样本根（""），请指定具体字段。');
       return;
-    }    setBusy(true);
+    }
+    setBusy(true);
     try {
       const data = await callMigrate(baselineSchema, currentSchema, samples, requestMappings);
+      // Accept only if this is still the latest run and none of its inputs
+      // (sample text, mappings, defaults, either schema) changed meanwhile;
+      // an expired response must not backfill errors or overwrite a new run.
+      if (!acceptResponse(seq, runSeqRef.current, submittedSignature, inputSignature)) return;
       setResult(data);
     } catch (e) {
+      if (!acceptResponse(seq, runSeqRef.current, submittedSignature, inputSignature)) return;
       setError(e.message);
       if (e.data && Array.isArray(e.data.invalidMappings)) {
         setInvalidMappings(e.data.invalidMappings);
       }
     } finally {
-      setBusy(false);
+      if (seq === runSeqRef.current) setBusy(false);
     }
   }
 
@@ -316,8 +382,8 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
           </button>
         </div>
       </div>
-      {mappingError && <div className="alert alert--err">{mappingError}</div>}
-      {invalidMappings.length > 0 && (
+      {mappingError && isFresh && <div className="alert alert--err">{mappingError}</div>}
+      {invalidMappings.length > 0 && isFresh && (
         <ul className="slice-problem-list">
           {invalidMappings.map((problem) => (
             <li key={problem.index}>
@@ -337,17 +403,24 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
           onClick={run}
           disabled={busy || text.trim() === ""}
         >
-          {busy ? "迁移中…" : "开始迁移"}
+          {busy ? "迁移中…" : showResult || isFresh ? "重新迁移" : "开始迁移"}
         </button>
-        {result && successfulSamples.length > 0 && (
+        {showResult && successfulSamples.length > 0 && (
           <button type="button" className="btn" onClick={copySuccessful}>
             {copied ? "✓ 已复制" : `仅复制成功结果（${successfulSamples.length} 条）`}
           </button>
         )}
       </div>
-      {error && <div className="alert alert--err">{error}</div>}
+      {showStale && !busy && (
+        <div className="alert alert--info">
+          自上次提交迁移后输入已变更（旧样本文本、映射路径/默认值或基线/当前 Schema），上一次迁移的
+          汇总、明细与「仅复制成功结果」均已失效并隐藏，避免导出与当前配置不符的样本；
+          请点击「开始迁移」重新迁移。
+        </div>
+      )}
+      {error && isFresh && <div className="alert alert--err">{error}</div>}
 
-      {result && (
+      {showResult && (
         <>
           <div className="scan-summary">
             {STATUS_ORDER.map((status) => (
@@ -355,7 +428,10 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
                 {STATUS_META[status].label} {result.summary[status]}
               </span>
             ))}
-            <span className="panel__meta">共 {result.total} 条 · 点击单条展开前后对比</span>
+            <span className="panel__meta">
+              结果绑定提交时的旧样本、映射配置与两版 Schema · 共 {result.total} 条 ·
+              点击单条展开前后对比
+            </span>
           </div>
 
           {groups.map(([status, items]) =>

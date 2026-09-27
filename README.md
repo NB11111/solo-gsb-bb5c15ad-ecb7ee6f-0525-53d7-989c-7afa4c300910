@@ -289,6 +289,13 @@ Ajv（`allErrors`）把每条样本对当前校验目标逐条校验，再把全
 - 单次最多 **200** 条样本；样本集非数组/为空、映射集为空、映射字段类型错误返回 400；
   Schema 无法编译或映射配置语义非法返回 422（携带 `invalidMappings` 明细）。
 - 重新归纳或更换基线后，旧迁移结果自动失效清空，需重新迁移。
+- **结果与提交时的输入绑定**：每次迁移的结果同时绑定提交那一刻的旧样本文本、完整映射配置
+  （源/目标路径与默认值）以及基线、当前两版 Schema。迁移成功后再修改旧样本、任一映射路径或
+  默认值、或切换基线/当前 Schema，旧的汇总、单条明细与「仅复制成功结果」入口会**立即隐藏**并
+  提示重新迁移，避免导出与当前配置不符的样本。
+- **进行中的请求防回填**：请求未返回时切换基线/当前 Schema（或改动样本与映射），该请求随即作废；
+  过期响应返回时既不会回填错误，也不会覆盖随后发起的新一轮迁移。只有输入仍与提交时完全一致时，
+  其成功或失败结果才会被接纳；重新执行后，展示与复制的均为本次迁移的结果。
 
 ## 发布门禁：判定规则
 
@@ -468,7 +475,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移、字段关系挖掘、错误热点聚簇、HTTP API 与发布门禁（254 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘、错误热点聚簇、HTTP API 与发布门禁（261 项）
 ```
 
 ## API
@@ -726,17 +733,18 @@ curl -s -X POST http://localhost:8080/api/relation/enhance \
 │   ├── index.js            # 入口：监听 PORT（默认 8080）
 │   └── test/               # node:test 单元与 API 测试
 └── client/
-    ├── test/               # 发布门禁（SemVer 解析/比较/判定）单元测试
+    ├── test/               # 发布门禁（SemVer 解析/比较/判定）与迁移输入绑定单元测试
     └── src/
         ├── App.jsx                 # 双栏布局、样本管理、归纳/校验/演进/变体流程、基线（sessionStorage）
         ├── gate.js                 # 发布门禁：SemVer 2.0.0 解析/比较 + 放行判定（纯函数）
+        ├── migrationBinding.js    # 历史样本迁移的输入绑定指纹与过期响应接纳判定（纯函数）
         ├── components/SchemaTree.jsx   # 树形视图 + 样本路径标注 + const 徽章 + 契约切片可勾选模式
         ├── components/ValidatePanel.jsx # 校验面板：归纳 Schema / 事件变体契约双目标，JSON Pointer 错误列表
         ├── components/HotspotPanel.jsx   # 错误热点：待检样本数组输入、按受影响样本数降序的聚簇列表、样本索引与实例 Pointer 展开
         ├── components/DiffPanel.jsx     # 契约演进面板：视角切换、破坏性筛选、按 Pointer 分组
         ├── components/CounterexamplePanel.jsx # 反例：样本格式化展示、双侧校验结果、复制按钮
         ├── components/SampleScanPanel.jsx  # 样本影响扫描：数组输入、四分类汇总、单条双侧错误展开
-        ├── components/MigrationPanel.jsx   # 历史样本迁移：旧样本数组 + 源→目标映射（可选默认值）、深度规划/原子执行、成功/冲突/校验失败汇总、前后对比、仅复制成功结果
+        ├── components/MigrationPanel.jsx   # 历史样本迁移：旧样本数组 + 源→目标映射（可选默认值）、深度规划/原子执行、成功/冲突/校验失败汇总、前后对比、仅复制成功结果；结果与提交时样本/映射/两版 Schema 绑定，输入变更立即隐藏并提示重迁，进行中的过期响应不回填
         ├── components/ContributionPanel.jsx # 样本贡献度：留一法分析入口、关键/冗余汇总筛选、定位原样本
         ├── components/AnonymizePanel.jsx    # 匿名化导出：规则编辑、命中/未命中/错误预览、复制匿名化样本
         ├── components/SlicePanel.jsx        # 契约切片：可勾选 Schema 树、字段数/样本数预览、分别复制切片 Schema 与投影样本
