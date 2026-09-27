@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { migrateSamples as callMigrate } from "../api.js";
 import { SideResult } from "./CounterexamplePanel.jsx";
 
@@ -146,38 +146,59 @@ function SampleItem({ item }) {
  * success/conflict/invalid, expands a before/after comparison per sample and
  * copies ONLY the successful results.
  *
- * Schemas changing (re-inferred or baseline replaced) drops the previous run,
- * mirroring the sample impact scan.
+ * The run outcome (success or failure) is stored together with a signature of
+ * the inputs it ran against: the submitted sample text, the full mapping rows
+ * (pointers + default JSON text) and both schemas. Editing any of them stops
+ * the old summary, per-sample details and the copy entry from rendering and
+ * shows a "please re-migrate" hint instead (the same convention as the
+ * anonymize/contribution panels). A response that arrives after the inputs
+ * changed is dropped rather than applied, so a stale success or failure can
+ * neither revive an outdated result nor backfill an error over the current
+ * configuration.
  */
 export default function MigrationPanel({ baselineSchema, currentSchema }) {
   const [text, setText] = useState("");
-  const [parseError, setParseError] = useState(null);
-  const [error, setError] = useState(null);
-  const [mappingError, setMappingError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [mappings, setMappings] = useState([
     { from: "/phone", to: "/contact/phone", defaultText: "" },
   ]);
-  const [result, setResult] = useState(null);
-  const [invalidMappings, setInvalidMappings] = useState([]);
+  // The outcome of the last run attempt, bound to the inputs it ran with:
+  //   { signature, ok: true, data }
+  //   { signature, ok: false, kind: "parse" | "mapping" | "run", message, invalidMappings? }
+  const [outcome, setOutcome] = useState(null);
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    setResult(null);
-    setError(null);
-    setInvalidMappings([]);
-  }, [baselineSchema, currentSchema]);
+  // Everything a run depends on; any edit to any of these changes the
+  // signature and therefore invalidates the stored outcome.
+  const runSignature = JSON.stringify([text, mappings, baselineSchema, currentSchema]);
+  // Latest signature mirrored into a ref, so an in-flight request can tell on
+  // arrival whether the inputs it ran against are still the current ones.
+  const signatureRef = useRef(runSignature);
+  signatureRef.current = runSignature;
+
+  // Derived invalidation: any input edit changes the signature, so the old
+  // outcome stops rendering and an explicit "invalidated" hint appears instead.
+  const current = outcome && outcome.signature === runSignature ? outcome : null;
+  const invalidated = outcome !== null && outcome.signature !== runSignature;
+
+  const data = current && current.ok ? current.data : null;
+  const failure = current && !current.ok ? current : null;
+  const parseError = failure && failure.kind === "parse" ? failure.message : null;
+  const mappingError = failure && failure.kind === "mapping" ? failure.message : null;
+  const runError = failure && failure.kind === "run" ? failure.message : null;
+  const invalidMappings =
+    failure && Array.isArray(failure.invalidMappings) ? failure.invalidMappings : [];
 
   const groups = useMemo(() => {
-    if (!result) return [];
+    if (!data) return [];
     const byStatus = new Map(STATUS_ORDER.map((s) => [s, []]));
-    for (const item of result.samples) byStatus.get(item.status).push(item);
+    for (const item of data.samples) byStatus.get(item.status).push(item);
     return STATUS_ORDER.map((s) => [s, byStatus.get(s)]);
-  }, [result]);
+  }, [data]);
 
   const successfulSamples = useMemo(
-    () => (result ? result.samples.filter((s) => s.status === "success").map((s) => s.after) : []),
-    [result]
+    () => (data ? data.samples.filter((s) => s.status === "success").map((s) => s.after) : []),
+    [data]
   );
 
   function updateMapping(index, next) {
@@ -204,35 +225,47 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
   }
 
   async function run() {
-    setError(null);
-    setMappingError(null);
-    setInvalidMappings([]);
-    setResult(null);
+    setCopied(false);
+    const signature = runSignature;
     let samples;
     try {
       samples = JSON.parse(text);
-      setParseError(null);
     } catch (e) {
-      setParseError(e.message);
+      setOutcome({ signature, ok: false, kind: "parse", message: e.message });
       return;
     }
     if (!Array.isArray(samples)) {
-      setError('输入必须是 JSON 数组：每个元素为一条旧样本，例如 [{"phone": "123"}, {"phone": null}]。');
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "run",
+        message: '输入必须是 JSON 数组：每个元素为一条旧样本，例如 [{"phone": "123"}, {"phone": null}]。',
+      });
       return;
     }
     if (samples.length === 0) {
-      setError("样本数组不能为空。");
+      setOutcome({ signature, ok: false, kind: "run", message: "样本数组不能为空。" });
       return;
     }
     if (samples.length > MAX_SAMPLES) {
-      setError(`单次最多迁移 ${MAX_SAMPLES} 条样本，当前共 ${samples.length} 条，请分批迁移。`);
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "run",
+        message: `单次最多迁移 ${MAX_SAMPLES} 条样本，当前共 ${samples.length} 条，请分批迁移。`,
+      });
       return;
     }
     let requestMappings;
     try {
       requestMappings = buildMappings();
     } catch (e) {
-      setMappingError(`默认值必须是合法 JSON（如 null、""、0、{"x":1}）：${e.message}`);
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "mapping",
+        message: `默认值必须是合法 JSON（如 null、""、0、{"x":1}）：${e.message}`,
+      });
       return;
     }
     if (
@@ -241,21 +274,41 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
     ) {
       // A blank source and blank target together is an unconfigured row;
       // source "" alone is valid (it addresses the sample root).
-      setMappingError("请至少配置一条映射，且源与目标不能同时留空。");
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "mapping",
+        message: "请至少配置一条映射，且源与目标不能同时留空。",
+      });
       return;
     }
     if (requestMappings.some((m) => m.to === "")) {
-      setMappingError('目标 JSON Pointer 不能为样本根（""），请指定具体字段。');
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "mapping",
+        message: '目标 JSON Pointer 不能为样本根（""），请指定具体字段。',
+      });
       return;
-    }    setBusy(true);
+    }
+    setBusy(true);
     try {
-      const data = await callMigrate(baselineSchema, currentSchema, samples, requestMappings);
-      setResult(data);
+      const result = await callMigrate(baselineSchema, currentSchema, samples, requestMappings);
+      // Inputs changed while the request was in flight: the response is
+      // stale, so drop it instead of reviving an outdated result.
+      if (signatureRef.current !== signature) return;
+      setOutcome({ signature, ok: true, data: result });
     } catch (e) {
-      setError(e.message);
-      if (e.data && Array.isArray(e.data.invalidMappings)) {
-        setInvalidMappings(e.data.invalidMappings);
-      }
+      // A stale failure must not backfill an error over the current inputs
+      // or overwrite a newer run either.
+      if (signatureRef.current !== signature) return;
+      setOutcome({
+        signature,
+        ok: false,
+        kind: "run",
+        message: e.message,
+        invalidMappings: e.data && Array.isArray(e.data.invalidMappings) ? e.data.invalidMappings : null,
+      });
     } finally {
       setBusy(false);
     }
@@ -339,23 +392,28 @@ export default function MigrationPanel({ baselineSchema, currentSchema }) {
         >
           {busy ? "迁移中…" : "开始迁移"}
         </button>
-        {result && successfulSamples.length > 0 && (
+        {data && successfulSamples.length > 0 && (
           <button type="button" className="btn" onClick={copySuccessful}>
             {copied ? "✓ 已复制" : `仅复制成功结果（${successfulSamples.length} 条）`}
           </button>
         )}
       </div>
-      {error && <div className="alert alert--err">{error}</div>}
+      {invalidated && (
+        <div className="alert alert--info">
+          样本文本、映射配置或 Schema 已变化，上次迁移结果已失效，请重新迁移。
+        </div>
+      )}
+      {runError && <div className="alert alert--err">{runError}</div>}
 
-      {result && (
+      {data && (
         <>
           <div className="scan-summary">
             {STATUS_ORDER.map((status) => (
               <span key={status} className={`migrate-badge migrate-badge--${STATUS_META[status].cls}`}>
-                {STATUS_META[status].label} {result.summary[status]}
+                {STATUS_META[status].label} {data.summary[status]}
               </span>
             ))}
-            <span className="panel__meta">共 {result.total} 条 · 点击单条展开前后对比</span>
+            <span className="panel__meta">共 {data.total} 条 · 点击单条展开前后对比</span>
           </div>
 
           {groups.map(([status, items]) =>
